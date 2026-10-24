@@ -1,127 +1,211 @@
-import requests
+"""ZDG Patch Intelligence API: los KBs más importantes de Windows desde MSRC."""
+
+import logging
 import re
-from datetime import datetime
-from fastapi import FastAPI
+import time
+from collections import defaultdict
+from typing import Any
+
+import requests
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+
+MSRC_BASE_URL = "https://api.msrc.microsoft.com/cvrf/v2.0"
+CACHE_TTL_SECONDS = 3600  # el documento CVRF pesa varios MB
+
+SYSTEM_PATTERNS = (
+    (re.compile(r"Windows 11 Version (\w+)"), "Windows 11 {}"),
+    (re.compile(r"Windows 10 Version (\w+)"), "Windows 10 {}"),
+    (re.compile(r"Windows Server (\d{4}(?: R2)?)"), "Windows Server {}"),
+)
+KB_PATTERN = re.compile(r"(?:KB)?(\d{6,7})\b")
+
+logger = logging.getLogger("zdg")
+
+session = requests.Session()
+session.headers.update({"Accept": "application/json"})
+
+_cache: dict[str, Any] = {"ts": 0.0, "data": None}
 
 app = FastAPI(
     title="ZDG Patch Intelligence API",
-    description="API oficial de Zero-Day Ghost para exponer los parches más recientes de Windows en tiempo real",
-    version="2.1.0"
+    description="KBs más importantes de Windows según MSRC",
+    version="2.3.0",
 )
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET"],
     allow_headers=["*"],
 )
 
-MSRC_BASE_URL = "https://api.msrc.microsoft.com/cvrf/v2.0"
+
+def msrc_get(path: str, timeout: int) -> dict:
+    response = session.get(f"{MSRC_BASE_URL}{path}", timeout=timeout)
+    response.raise_for_status()
+    return response.json()
+
+
+def get_latest_release() -> dict:
+    releases = msrc_get("/updates", timeout=15).get("value", [])
+    if not releases:
+        raise ValueError("MSRC no devolvió boletines")
+    return max(releases, key=lambda r: r.get("InitialReleaseDate", ""))
+
+
+def collect_products(node: Any, products: dict[str, str]) -> None:
+    """Recorre el ProductTree y arma {ProductID: nombre}."""
+    if isinstance(node, dict):
+        product_id, name = node.get("ProductID"), node.get("Value")
+        if isinstance(product_id, str) and isinstance(name, str):
+            products[product_id] = name
+        for value in node.values():
+            collect_products(value, products)
+    elif isinstance(node, list):
+        for item in node:
+            collect_products(item, products)
+
+
+def classify_system(product_name: str) -> str | None:
+    # Solo el SO: descarta ".NET on Windows 11...", Office, Edge, etc.
+    if not product_name.startswith("Windows"):
+        return None
+    for pattern, template in SYSTEM_PATTERNS:
+        match = pattern.search(product_name)
+        if match:
+            return template.format(match.group(1))
+    return None
+
+
+def extract_kb(remediation: dict) -> str | None:
+    candidates = (remediation.get("Description", {}).get("Value", ""), remediation.get("URL", ""))
+    for text in candidates:
+        match = KB_PATTERN.search(str(text))
+        if match:
+            return f"KB{match.group(1)}"
+    return None
+
+
+def vuln_risk(vuln: dict) -> dict:
+    """Riesgo de una CVE: explotada activamente, crítica y CVSS máximo."""
+    exploited, critical = False, False
+    for threat in vuln.get("Threats", []):
+        value = threat.get("Description", {}).get("Value", "")
+        if threat.get("Type") == 1 and "Exploited:Yes" in value:
+            exploited = True
+        elif threat.get("Type") == 3 and value == "Critical":
+            critical = True
+    scores = [s.get("BaseScore", 0) for s in vuln.get("CVSSScoreSets", [])]
+    return {"exploited": exploited, "critical": critical, "cvss": max(scores, default=0)}
+
+
+def priority(exploited: int, critical: int, max_cvss: float) -> str:
+    if exploited:
+        return "critica"
+    if critical or max_cvss >= 9:
+        return "alta"
+    return "media"
+
+
+def build_patches(cvrf: dict, release_id: str, release_date: str) -> list[dict]:
+    products: dict[str, str] = {}
+    collect_products(cvrf.get("ProductTree", {}), products)
+
+    # (kb, sistema) -> {cve: riesgo}
+    cves_by_kb_system: dict[tuple[str, str], dict[str, dict]] = defaultdict(dict)
+    builds_by_kb: dict[str, set[str]] = defaultdict(set)
+
+    for vuln in cvrf.get("Vulnerability", []):
+        cve = vuln.get("CVE")
+        if not cve:
+            continue
+        risk = vuln_risk(vuln)
+        for remediation in vuln.get("Remediations", []):
+            kb = extract_kb(remediation)
+            if not kb:
+                continue
+            for product_id in remediation.get("ProductID", []):
+                system = classify_system(products.get(product_id, ""))
+                if not system:
+                    continue
+                cves_by_kb_system[(kb, system)][cve] = risk
+                if remediation.get("FixedBuild"):
+                    builds_by_kb[kb].add(remediation["FixedBuild"])
+
+    # El KB principal de cada sistema es el que corrige más CVEs
+    primary: dict[str, tuple[str, int]] = {}
+    for (kb, system), cves in cves_by_kb_system.items():
+        if system not in primary or len(cves) > primary[system][1]:
+            primary[system] = (kb, len(cves))
+
+    grouped: dict[str, dict] = defaultdict(lambda: {"sistemas": set(), "cves": {}})
+    for system, (kb, _) in primary.items():
+        grouped[kb]["sistemas"].add(system)
+        grouped[kb]["cves"].update(cves_by_kb_system[(kb, system)])
+
+    patches = []
+    for kb, entry in grouped.items():
+        risks = entry["cves"].values()
+        exploited = sum(r["exploited"] for r in risks)
+        critical = sum(r["critical"] for r in risks)
+        max_cvss = max((r["cvss"] for r in risks), default=0)
+        patches.append(
+            {
+                "kb": kb,
+                "sistemas": sorted(entry["sistemas"]),
+                "prioridad": priority(exploited, critical, max_cvss),
+                "cves_corregidas": len(entry["cves"]),
+                "cves_explotadas": exploited,
+                "cves_criticas": critical,
+                "cvss_maximo": max_cvss,
+                "fixed_builds": sorted(builds_by_kb[kb]),
+                "fecha_lanzamiento": release_date,
+                "boletin_oficial": release_id,
+            }
+        )
+
+    return sorted(patches, key=lambda p: (p["cves_explotadas"], p["cvss_maximo"]), reverse=True)
+
+
+def fetch_patch_data() -> dict:
+    release = get_latest_release()
+    release_id = release["ID"]
+    release_date = release.get("InitialReleaseDate", "")[:10]
+
+    cvrf = msrc_get(f"/cvrf/{release_id}", timeout=60)
+    return {
+        "status": "success",
+        "fuente": "Microsoft Security Response Center (MSRC)",
+        "boletin_mes": release_id,
+        "parches": build_patches(cvrf, release_id, release_date),
+    }
+
+
+def get_patch_data() -> dict:
+    cached = _cache["data"]
+    if cached and time.time() - _cache["ts"] < CACHE_TTL_SECONDS:
+        return cached
+
+    try:
+        data = fetch_patch_data()
+    except (requests.RequestException, KeyError, ValueError) as exc:
+        logger.error("Error consultando MSRC: %s", exc)
+        if cached:
+            return {**cached, "status": "stale"}
+        raise HTTPException(status_code=502, detail="No se pudo consultar MSRC")
+
+    _cache.update(ts=time.time(), data=data)
+    return data
+
 
 @app.get("/api/v1/latest-kbs")
-def get_latest_windows_kbs():
-    headers = {"Accept": "application/json"}
-    
-    try:
-        # 1. Consultar el índice de actualizaciones de Microsoft
-        response = requests.get(f"{MSRC_BASE_URL}/updates", headers=headers, timeout=10)
-        if response.status_code != 200:
-            return {"status": "error", "message": "Error al conectar con MSRC de Microsoft."}
-            
-        releases = response.json().get("value", [])
-        current_year = str(datetime.now().year)
-        
-        # Filtramos los del año actual y los ORDENAMOS por fecha de lanzamiento descendente (el más nuevo primero)
-        releases_current_year = [rel for rel in releases if rel.get("ID", "").startswith(current_year)]
-        releases_current_year.sort(key=lambda x: x.get("InitialReleaseDate", ""), reverse=True)
-        
-        latest_release = releases_current_year[0] if releases_current_year else (releases[0] if releases else None)
-        
-        latest_release_id = latest_release.get("ID") if latest_release else f"{current_year}-Oct"
-        release_date = latest_release.get("InitialReleaseDate", "")[:10] if latest_release else "2026-10-13"
+def latest_kbs(limit: int = Query(10, ge=1, le=50)) -> dict:
+    data = get_patch_data()
+    patches = data["parches"][:limit]
+    return {**data, "total_parches": len(patches), "parches": patches}
 
-        # 2. Consultar el boletín CVRF detallado del mes más reciente
-        cvrf_res = requests.get(f"{MSRC_BASE_URL}/cvrf/{latest_release_id}", headers=headers, timeout=15)
-        
-        kbs_map = {}
-        
-        if cvrf_res.status_code == 200:
-            cvrf_data = cvrf_res.json()
-            
-            for vuln in cvrf_data.get("Vulnerability", []):
-                vuln_title = str(vuln.get("Title", ""))
-                
-                for rem in vuln.get("Remediations", []):
-                    desc = rem.get("Description", {}).get("Value", "")
-                    full_context = vuln_title + " " + desc
-                    
-                    match_kb = re.search(r'KB\d+', full_context)
-                    if match_kb:
-                        kb_code = match_kb.group(0)
-                        
-                        versiones_encontradas = re.findall(r'\b\d{2}H[12]\b', full_context)
-                        builds_especiales = re.findall(r'\b(2025|2022|2019|2016)\b', full_context)
-                        
-                        sistema = None
-                        if "Windows 11" in full_context:
-                            if versiones_encontradas:
-                                v_str = " / ".join(sorted(list(set(versiones_encontradas)), reverse=True))
-                                sistema = f"Windows 11 ({v_str})"
-                            else:
-                                sistema = "Windows 11"
-                        elif "Windows 10" in full_context:
-                            if "22H2" in full_context or "21H2" in full_context:
-                                sistema = "Windows 10 (22H2 / 21H2 ESU)"
-                            else:
-                                sistema = "Windows 10"
-                        elif "Server" in full_context:
-                            if builds_especiales:
-                                sistema = f"Windows Server ({' / '.join(set(builds_especiales))})"
-                            else:
-                                sistema = "Windows Server"
-
-                        if sistema:
-                            if kb_code not in kbs_map:
-                                kbs_map[kb_code] = {
-                                    "kb": kb_code,
-                                    "sistemas": set(),
-                                    "tipo": "Cumulative Security Update",
-                                    "fecha_lanzamiento": release_date,
-                                    "boletin_oficial": latest_release_id
-                                }
-                            kbs_map[kb_code]["sistemas"].add(sistema)
-
-        kbs_principales = []
-        for kb_code, info in kbs_map.items():
-            info["sistemas"] = list(info["sistemas"])
-            kbs_principales.append(info)
-
-        # Base de respaldo blindada con los datos reales del Patch Tuesday de Octubre 2026
-        if not kbs_principales:
-            kbs_principales = [
-                {"kb": "KB5127648", "sistemas": ["Windows 11 (26H2 / 25H2 / 24H2)"], "tipo": "Cumulative Security Update", "fecha_lanzamiento": release_date, "boletin_oficial": latest_release_id},
-                {"kb": "KB5127646", "sistemas": ["Windows 11 (26H1)"], "tipo": "Cumulative Security Update", "fecha_lanzamiento": release_date, "boletin_oficial": latest_release_id},
-                {"kb": "KB5126653", "sistemas": ["Windows 11 (23H2)"], "tipo": "Cumulative Security Update", "fecha_lanzamiento": release_date, "boletin_oficial": latest_release_id},
-                {"kb": "KB5126657", "sistemas": ["Windows 10 (22H2 ESU)"], "tipo": "Cumulative Security Update", "fecha_lanzamiento": release_date, "boletin_oficial": latest_release_id},
-                {"kb": "KB5126646", "sistemas": ["Windows Server (2025)"], "tipo": "Cumulative Security Update", "fecha_lanzamiento": release_date, "boletin_oficial": latest_release_id},
-                {"kb": "KB5126655", "sistemas": ["Windows Server (2022)"], "tipo": "Cumulative Security Update", "fecha_lanzamiento": release_date, "boletin_oficial": latest_release_id},
-                {"kb": "KB5126651", "sistemas": ["Windows Server (2019)"], "tipo": "Cumulative Security Update", "fecha_lanzamiento": release_date, "boletin_oficial": latest_release_id},
-                {"kb": "KB5126868", "sistemas": ["Windows Server (2016)"], "tipo": "Cumulative Security Update", "fecha_lanzamiento": release_date, "boletin_oficial": latest_release_id}
-            ]
-
-        return {
-            "status": "success",
-            "fuente": "Microsoft Security Response Center (MSRC)",
-            "boletin_mes": latest_release_id,
-            "total_parches_principales": len(kbs_principales),
-            "parches": kbs_principales
-        }
-
-    except Exception as e:
-        return {"status": "error", "detalles": str(e)}
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="127.0.0.1", port=8000)
